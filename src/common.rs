@@ -372,7 +372,10 @@ impl WalkOptions {
                     .is_none_or(|metadata| {
                         crossdev::is_same_device(device_ids[root_idx], metadata)
                     }))
-                && (entry.depth == 0 || !ignore_directory(&entry.path(), &ignore_dirs, &cwd))
+                && (entry.depth == 0
+                    || !ignore_directory_entry(entry, &ignore_dirs, |path| {
+                        ignore_directory(path, &ignore_dirs, &cwd)
+                    }))
                 && !is_excluded_while_walking(root_idx, entry)
         };
 
@@ -456,9 +459,104 @@ fn ignore_directory(path: &Path, ignore_dirs: &BTreeSet<PathBuf>, cwd: &Path) ->
     })
 }
 
+fn ignore_directory_entry(
+    entry: &walk::Entry,
+    ignore_dirs: &BTreeSet<PathBuf>,
+    matches_path: impl FnOnce(&Path) -> bool,
+) -> bool {
+    // The walker never descends into symlinks, so resolving an entry's ancestors cannot change
+    // its final directory name. Only plausible matches need a full path resolution.
+    ignore_dirs
+        .iter()
+        .any(|path| path.file_name() == Some(entry.file_name.as_os_str()))
+        && matches_path(&entry.path())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn directory_ignore_checks_skip_unrelated_entry_names() {
+        let root = tempfile::tempdir().unwrap();
+        let keep = root.path().join("keep");
+        let ignored = root.path().join("ignored");
+        std::fs::create_dir(&keep).unwrap();
+        std::fs::create_dir(&ignored).unwrap();
+        let entry = walk::Entry::from_path(&keep, crate::TraversalOptions::default()).unwrap();
+        let ignore_dirs = canonicalize_ignore_dirs(&[ignored]);
+        let resolutions = std::cell::Cell::new(0);
+
+        assert!(!ignore_directory_entry(&entry, &ignore_dirs, |path| {
+            resolutions.set(resolutions.get() + 1);
+            ignore_directory(path, &ignore_dirs, root.path())
+        }));
+        assert_eq!(
+            resolutions.get(),
+            0,
+            "an unrelated directory name should not resolve every ancestor for ignore matching"
+        );
+    }
+
+    #[test]
+    fn directory_ignore_checks_resolve_matching_names() {
+        let root = tempfile::tempdir().unwrap();
+        let ignored = root.path().join("ignored");
+        let same_name = root.path().join("other/ignored");
+        std::fs::create_dir(&ignored).unwrap();
+        std::fs::create_dir_all(&same_name).unwrap();
+        let ignore_dirs = canonicalize_ignore_dirs(std::slice::from_ref(&ignored));
+
+        for (path, expected) in [(ignored, true), (same_name, false)] {
+            let entry = walk::Entry::from_path(&path, crate::TraversalOptions::default()).unwrap();
+            let resolutions = std::cell::Cell::new(0);
+            assert_eq!(
+                ignore_directory_entry(&entry, &ignore_dirs, |path| {
+                    resolutions.set(resolutions.get() + 1);
+                    ignore_directory(path, &ignore_dirs, root.path())
+                }),
+                expected
+            );
+            assert_eq!(
+                resolutions.get(),
+                1,
+                "matching names still need the complete path comparison"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_ignore_checks_preserve_symlinked_ancestors() {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real");
+        let ignored = real.join("ignored");
+        std::fs::create_dir_all(&ignored).unwrap();
+        std::fs::create_dir_all(real.join("other/ignored")).unwrap();
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let ignore_dirs = canonicalize_ignore_dirs(&[ignored]);
+
+        for (path, expected) in [
+            (alias.join("ignored"), true),
+            (alias.join("other/ignored"), false),
+        ] {
+            let entry = walk::Entry::from_path(&path, crate::TraversalOptions::default()).unwrap();
+            assert_eq!(
+                ignore_directory_entry(&entry, &ignore_dirs, |path| {
+                    ignore_directory(path, &ignore_dirs, root.path())
+                }),
+                expected
+            );
+        }
+
+        let renamed_link = root.path().join("renamed-link");
+        std::os::unix::fs::symlink(real.join("ignored"), &renamed_link).unwrap();
+        assert!(
+            ignore_directory(&renamed_link, &ignore_dirs, root.path()),
+            "arbitrary path queries must still resolve symlinks with a different final name"
+        );
+    }
 
     #[test]
     fn every_byte_format_handles_the_maximum_snapshot_size() {
