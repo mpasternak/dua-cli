@@ -1,7 +1,3 @@
-#[cfg(any(windows, target_os = "macos"))]
-use crate::walk::walk_root_entries as walk_roots;
-#[cfg(not(any(windows, target_os = "macos")))]
-use crate::walk::walk_roots;
 use crate::{crossdev, walk};
 use anyhow::Context;
 use byte_unit::{Byte, Unit, UnitType};
@@ -270,6 +266,8 @@ pub struct WalkOptions {
 /// Tells whether an entry found under the root with the given index is left out of the traversal.
 type ExcludeEntry = Arc<dyn Fn(usize, &walk::Entry) -> bool + Send + Sync>;
 
+type IndexedRoot = (usize, Result<walk::Entry, walk::Error>);
+
 /// A root prepared for a filesystem walk.
 pub(crate) struct WalkRoot {
     /// Index used to associate emitted events with the original input path.
@@ -304,6 +302,52 @@ impl WalkOptions {
         skip_root: bool,
         order: walk::Order,
     ) -> impl Iterator<Item = (usize, walk::RootEvent)> + use<> {
+        let (indexed_roots, descend, is_excluded) = self.prepare_roots(roots);
+        let walk = walk::walk_root_entries(
+            indexed_roots,
+            self.threads,
+            order,
+            self.metadata_options,
+            move |root_idx, entry| descend(root_idx, entry),
+        );
+
+        walk.filter(move |(root_idx, event)| match event {
+            walk::RootEvent::Entry(Ok(entry)) => {
+                (!skip_root || entry.depth > 0) && !is_excluded(*root_idx, entry)
+            }
+            walk::RootEvent::Entry(Err(_)) | walk::RootEvent::Finished => true,
+        })
+    }
+
+    /// Reduce entries where metadata is collected, retaining the ordinary exclusion rules.
+    pub(crate) fn visit_from_paths(
+        &self,
+        roots: Vec<WalkRoot>,
+        visit: impl Fn(usize, usize, Vec<Result<walk::Entry, walk::Error>>) + Send + Sync + 'static,
+    ) -> walk::RootWalk {
+        let (indexed_roots, descend, is_excluded) = self.prepare_roots(roots);
+        walk::RootWalk::with_batch_visitor(
+            indexed_roots,
+            self.threads,
+            self.metadata_options,
+            move |root_idx, entry| descend(root_idx, entry),
+            move |worker_idx, root_idx, mut entries| {
+                entries.retain(|entry| match entry {
+                    Ok(entry) => !is_excluded(root_idx, entry),
+                    Err(_) => true,
+                });
+                if !entries.is_empty() {
+                    visit(worker_idx, root_idx, entries);
+                }
+            },
+        )
+    }
+
+    /// Share root, device, and pattern preparation between streamed and reduced walks.
+    fn prepare_roots(
+        &self,
+        roots: Vec<WalkRoot>,
+    ) -> (Vec<IndexedRoot>, ExcludeEntry, ExcludeEntry) {
         let num_roots = roots
             .iter()
             .map(|root| root.index)
@@ -320,15 +364,16 @@ impl WalkOptions {
                 device_ids[root.index] = root.device_id;
                 root_paths[root.index] = root.pattern_root;
                 #[cfg(any(windows, target_os = "macos"))]
+                let entry = root.entry;
+                #[cfg(not(any(windows, target_os = "macos")))]
+                let entry = None;
                 indexed_roots.push((
                     root.index,
-                    root.entry.map_or_else(
+                    entry.map_or_else(
                         || walk::Entry::from_path(&root.path, self.metadata_options),
                         Ok,
                     ),
                 ));
-                #[cfg(not(any(windows, target_os = "macos")))]
-                indexed_roots.push((root.index, root.path));
                 (device_ids, root_paths, indexed_roots)
             },
         );
@@ -363,7 +408,7 @@ impl WalkOptions {
             })
         };
         let is_excluded_while_walking = Arc::clone(&is_excluded);
-        let descend = move |root_idx: usize, entry: &walk::Entry| {
+        let descend: ExcludeEntry = Arc::new(move |root_idx: usize, entry: &walk::Entry| {
             (cross_filesystems
                 || entry
                     .metadata
@@ -377,22 +422,9 @@ impl WalkOptions {
                         ignore_directory(path, &ignore_dirs, &cwd)
                     }))
                 && !is_excluded_while_walking(root_idx, entry)
-        };
+        });
 
-        let walk = walk_roots(
-            indexed_roots,
-            self.threads,
-            order,
-            self.metadata_options,
-            descend,
-        );
-
-        walk.filter(move |(root_idx, event)| match event {
-            walk::RootEvent::Entry(Ok(entry)) => {
-                (!skip_root || entry.depth > 0) && !is_excluded(*root_idx, entry)
-            }
-            walk::RootEvent::Entry(Err(_)) | walk::RootEvent::Finished => true,
-        })
+        (indexed_roots, descend, is_excluded)
     }
 }
 
