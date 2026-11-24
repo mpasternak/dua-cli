@@ -476,7 +476,7 @@ struct PoolShared {
 
 struct Pool {
     shared: Arc<PoolShared>,
-    events: Receiver<Event>,
+    events: Option<Receiver<Event>>,
     handles: Vec<thread::JoinHandle<()>>,
 }
 
@@ -718,12 +718,9 @@ impl Walk {
                 return None;
             }
 
-            let pool = self.pool.as_ref()?;
+            let events = self.pool.as_ref()?.events.as_ref()?;
             let event = if cancelled.is_some() {
-                match pool
-                    .events
-                    .recv_timeout(std::time::Duration::from_millis(100))
-                {
+                match events.recv_timeout(std::time::Duration::from_millis(100)) {
                     Ok(event) => event,
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -731,7 +728,7 @@ impl Walk {
                     }
                 }
             } else {
-                match pool.events.recv() {
+                match events.recv() {
                     Ok(event) => event,
                     Err(_) => {
                         return Some(Err(io::Error::other("directory worker stopped").into()));
@@ -878,7 +875,7 @@ impl Iterator for RootWalk {
             if let Some(entry) = self.next.pop() {
                 return Some(entry);
             }
-            match self.pool.as_ref()?.events.recv() {
+            match self.pool.as_ref()?.events.as_ref()?.recv() {
                 Ok(event) => {
                     if let Some(item) = self.accept_event(event) {
                         return Some(item);
@@ -906,7 +903,8 @@ impl RootWalk {
     /// Dropping the walk stops traversal and waits for active visits to return.
     ///
     /// A worker panic in an unwind build stops traversal and yields a terminal
-    /// [`RootEvent::Entry`] error. Panics during initial visits propagate on the calling thread.
+    /// [`RootEvent::Entry`] error before waiting for active visits. Panics during initial visits
+    /// propagate on the calling thread.
     ///
     /// # Panics
     ///
@@ -946,12 +944,10 @@ impl RootWalk {
             if let Some(entry) = self.next.pop() {
                 return Ok(Some(entry));
             }
-            let Some(pool) = &self.pool else {
+            let Some(events) = self.pool.as_ref().and_then(|pool| pool.events.as_ref()) else {
                 return Ok(None);
             };
-            let event = pool
-                .events
-                .recv_timeout(timeout.saturating_sub(started.elapsed()))?;
+            let event = events.recv_timeout(timeout.saturating_sub(started.elapsed()))?;
             if let Some(item) = self.accept_event(event) {
                 return Ok(Some(item));
             }
@@ -982,7 +978,9 @@ impl RootWalk {
             Event::RootFinished { root_idx } => Some((root_idx, RootEvent::Finished)),
             Event::WorkerFailed { root_idx, error } => {
                 self.next.clear();
-                self.pool = None;
+                if let Some(pool) = &mut self.pool {
+                    pool.disconnect();
+                }
                 Some((root_idx, RootEvent::Entry(Err(error))))
             }
             Event::Finished => {
@@ -1136,7 +1134,7 @@ fn start_pool_with_visitor(
 
     Pool {
         shared,
-        events: event_rx,
+        events: Some(event_rx),
         handles,
     }
 }
@@ -1264,13 +1262,18 @@ fn worker_loop(
     }
 }
 
-impl Drop for Pool {
-    fn drop(&mut self) {
+impl Pool {
+    fn disconnect(&mut self) {
         self.shared.stop.store(true, AtomicOrdering::Relaxed);
         self.shared.wake_workers();
         // Workers blocked on the bounded output channel must be released before joining them.
-        let (_, disconnected) = sync_channel(0);
-        drop(std::mem::replace(&mut self.events, disconnected));
+        drop(self.events.take());
+    }
+}
+
+impl Drop for Pool {
+    fn drop(&mut self) {
+        self.disconnect();
         for handle in self.handles.drain(..) {
             handle.join().ok();
         }
@@ -1910,8 +1913,7 @@ mod tests {
                     } else {
                         Ok(walk.next())
                     };
-                    let exhausted = walk.pool.is_none()
-                        && walk.next().is_none()
+                    let exhausted = walk.next().is_none()
                         && matches!(walk.next_timeout(Duration::ZERO), Ok(None));
                     done_tx.send((result, exhausted)).unwrap();
                 });
@@ -1967,6 +1969,63 @@ mod tests {
     #[test]
     fn visitor_panic_terminates_timed_walk() {
         assert_visitor_panic_terminates_walk(true);
+    }
+
+    #[cfg(panic = "unwind")]
+    #[test]
+    fn visitor_panic_is_reported_while_another_visitor_is_blocked() {
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        for root in ["blocked", "panicking"] {
+            let path = dir.path().join(root);
+            fs::create_dir(&path).unwrap();
+            fs::write(path.join("file"), b"data").unwrap();
+        }
+        let (blocked_tx, blocked_rx) = crossbeam::channel::bounded(1);
+        let (release_tx, release_rx) = crossbeam::channel::bounded::<()>(0);
+        let (panic_tx, panic_rx) = crossbeam::channel::bounded(1);
+        let mut walk = visit_roots(
+            [
+                (0, dir.path().join("blocked")),
+                (1, dir.path().join("panicking")),
+            ],
+            2,
+            Options::default().queued_batches_per_worker(0),
+            |_, _| true,
+            move |_, root, entries| {
+                if entries
+                    .iter()
+                    .any(|entry| entry.as_ref().is_ok_and(|entry| entry.depth > 0))
+                {
+                    if root == 0 {
+                        blocked_tx.send(()).unwrap();
+                        release_rx.recv().ok();
+                    } else if panic_rx.recv().is_ok() {
+                        panic!("visitor failed");
+                    }
+                }
+            },
+        );
+        blocked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        panic_tx.send(()).unwrap();
+        let (done_tx, done_rx) = crossbeam::channel::bounded(1);
+        let reader = thread::spawn(move || {
+            let event = walk.next_timeout(Duration::from_secs(2));
+            let exhausted =
+                walk.next().is_none() && matches!(walk.next_timeout(Duration::ZERO), Ok(None));
+            done_tx.send((event, exhausted)).unwrap();
+        });
+        let result = done_rx.recv_timeout(Duration::from_secs(3));
+        drop(release_tx);
+        reader.join().unwrap();
+        let (event, exhausted) =
+            result.expect("failure must be reported before releasing the blocked visitor");
+        let Ok(Some((1, RootEvent::Entry(Err(error))))) = event else {
+            panic!("the worker panic must be reported as a terminal error");
+        };
+        assert!(error.to_string().contains("visitor failed"));
+        assert!(exhausted);
     }
 
     #[test]
@@ -2945,6 +3004,8 @@ mod tests {
         loop {
             match pool
                 .events
+                .as_ref()
+                .unwrap()
                 .recv_timeout(std::time::Duration::from_secs(10))
                 .expect("the metadata walk must finish")
             {
@@ -3029,6 +3090,8 @@ mod tests {
         loop {
             match pool
                 .events
+                .as_ref()
+                .unwrap()
                 .recv_timeout(std::time::Duration::from_secs(10))
                 .expect("small-directory results and completion must be flushed")
             {
@@ -3244,7 +3307,8 @@ mod tests {
         }
 
         assert_eq!(worker.len(), MAX_QUEUED_STAT_JOBS);
-        let Event::Batch { root_idx, batch } = pool.events.try_recv().unwrap() else {
+        let Event::Batch { root_idx, batch } = pool.events.as_ref().unwrap().try_recv().unwrap()
+        else {
             panic!("a full queue must process the next metadata batch inline");
         };
         assert_eq!(root_idx, 7);
@@ -3286,6 +3350,8 @@ mod tests {
                     .as_ref()
                     .unwrap()
                     .events
+                    .as_ref()
+                    .unwrap()
                     .recv_timeout(std::time::Duration::from_secs(2))
                 {
                     child_started = batch.as_ref().is_ok_and(|entries| {
