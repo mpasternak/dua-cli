@@ -491,6 +491,8 @@ struct Pool {
 pub struct RootWalk {
     /// Entries buffered for delivery, by root index.
     next: Vec<(usize, RootEvent)>,
+    /// Visitor roots completed during preparation, in stack order.
+    initial_finished: Vec<usize>,
     /// See [`Walk::pool`].
     pool: Option<Pool>,
 }
@@ -568,6 +570,7 @@ pub fn stream_roots(threads: usize, order: Order, options: Options) -> (RootSend
         sender,
         RootWalk {
             next: Vec::new(),
+            initial_finished: Vec::new(),
             pool: Some(pool),
         },
     )
@@ -839,29 +842,39 @@ fn start_root_walk<Root>(
     options: Options,
     visitor: Option<Arc<VisitBatch>>,
 ) -> RootWalk {
-    let indices = roots
-        .iter()
-        .map(|(index, _)| *index)
-        .collect::<HashSet<_>>();
-    assert_eq!(indices.len(), roots.len(), "root indices must be unique");
+    assert_eq!(
+        roots
+            .iter()
+            .map(|(index, _)| *index)
+            .collect::<HashSet<_>>()
+            .len(),
+        roots.len(),
+        "root indices must be unique"
+    );
     let descend: Arc<Descend> = Arc::new(descend);
-    let (mut next, root_jobs, next_directory_id) = begin_walks(
+    let mut next = Vec::new();
+    let mut initial_finished = Vec::new();
+    let (root_jobs, next_directory_id) = begin_walks(
         roots
             .into_iter()
             .map(|(root_idx, root)| (root_idx, prepare(root))),
         &descend,
-    );
-    if let Some(visitor) = &visitor {
-        let mut completed = Vec::new();
-        for (root_idx, event) in next.into_iter().rev() {
-            match event {
-                RootEvent::Entry(entry) => visitor(0, root_idx, vec![entry]),
-                RootEvent::Finished => completed.push((root_idx, RootEvent::Finished)),
+        |root_idx, entry, finished| {
+            if let Some(visitor) = &visitor {
+                visitor(0, root_idx, vec![entry]);
+                if finished {
+                    initial_finished.push(root_idx);
+                }
+            } else {
+                next.push((root_idx, RootEvent::Entry(entry)));
+                if finished {
+                    next.push((root_idx, RootEvent::Finished));
+                }
             }
-        }
-        completed.reverse();
-        next = completed;
-    }
+        },
+    );
+    next.reverse();
+    initial_finished.reverse();
     let pool = if root_jobs.is_empty() {
         None
     } else {
@@ -870,7 +883,11 @@ fn start_root_walk<Root>(
         start_jobs(&pool, root_jobs);
         Some(pool)
     };
-    RootWalk { next, pool }
+    RootWalk {
+        next,
+        initial_finished,
+        pool,
+    }
 }
 
 impl Iterator for RootWalk {
@@ -878,7 +895,7 @@ impl Iterator for RootWalk {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            if let Some(entry) = self.next.pop() {
+            if let Some(entry) = self.pop_buffered() {
                 return Some(entry);
             }
             match self.pool.as_ref()?.events.as_ref()?.recv() {
@@ -903,8 +920,8 @@ impl RootWalk {
     ///
     /// As in [`walk_root_entries`], supplied entries are re-rooted without querying their paths.
     /// `visit` receives a worker index in `0..threads.max(1)`, a root index, and a batch of
-    /// entries or I/O errors. Initial root entries are visited on the calling thread with worker
-    /// index zero before descendant jobs start. Later visits use completion order and may run
+    /// entries or I/O errors. Initial root entries are visited as they are prepared on the calling
+    /// thread with worker index zero. Later visits use completion order and may run
     /// concurrently. The iterator yields each root's completion event after all its visits.
     /// Dropping the walk stops traversal and waits for active visits to return.
     ///
@@ -947,7 +964,7 @@ impl RootWalk {
     ) -> Result<Option<(usize, RootEvent)>, std::sync::mpsc::RecvTimeoutError> {
         let started = std::time::Instant::now();
         loop {
-            if let Some(entry) = self.next.pop() {
+            if let Some(entry) = self.pop_buffered() {
                 return Ok(Some(entry));
             }
             let Some(events) = self.pool.as_ref().and_then(|pool| pool.events.as_ref()) else {
@@ -961,6 +978,14 @@ impl RootWalk {
                 return Err(std::sync::mpsc::RecvTimeoutError::Timeout);
             }
         }
+    }
+
+    fn pop_buffered(&mut self) -> Option<(usize, RootEvent)> {
+        self.next.pop().or_else(|| {
+            self.initial_finished
+                .pop()
+                .map(|root_idx| (root_idx, RootEvent::Finished))
+        })
     }
 
     fn accept_event(&mut self, event: Event) -> Option<(usize, RootEvent)> {
@@ -1145,13 +1170,12 @@ fn start_pool_with_visitor(
     }
 }
 
-/// Prepare initial root events and directory jobs.
-/// Returns events in stack order for [`RootWalk::next`] to pop, plus jobs requiring a worker pool.
+/// Prepare initial roots and report each entry with whether it needs no further work.
 fn begin_walks(
     roots: impl IntoIterator<Item = (usize, Result<Entry, Error>)>,
     descend: &Arc<Descend>,
-) -> (Vec<(usize, RootEvent)>, Vec<Job>, usize) {
-    let mut next = Vec::new();
+    mut initial: impl FnMut(usize, Result<Entry, Error>, bool),
+) -> (Vec<Job>, usize) {
     let mut jobs = Vec::new();
     let mut next_directory_id = 0;
     for (root_idx, mut entry) in roots {
@@ -1187,13 +1211,9 @@ fn begin_walks(
         } else {
             false
         };
-        next.push((root_idx, RootEvent::Entry(entry)));
-        if !has_job {
-            next.push((root_idx, RootEvent::Finished));
-        }
+        initial(root_idx, entry, !has_job);
     }
-    next.reverse();
-    (next, jobs, next_directory_id)
+    (jobs, next_directory_id)
 }
 
 /// Seed an idle pool with one initial job per active root.
@@ -2108,6 +2128,43 @@ mod tests {
     }
 
     #[test]
+    fn visitor_walk_accounts_initial_entries_during_preparation() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let seen = Arc::new(AtomicUsize::new(0));
+        let visits = Arc::clone(&seen);
+        let mut walk = visit_roots(
+            [
+                (7, file.path().to_owned()),
+                (2, dir.path().to_owned()),
+                (9, dir.path().join("missing")),
+            ],
+            4,
+            Options::default(),
+            move |root, _| {
+                assert_eq!(root, 2);
+                assert_eq!(seen.load(AtomicOrdering::Relaxed), 1);
+                false
+            },
+            move |worker, _, entries| {
+                assert_eq!(worker, 0);
+                assert_eq!(entries.len(), 1);
+                visits.fetch_add(1, AtomicOrdering::Relaxed);
+            },
+        );
+        assert!(walk.pool.is_none());
+        assert_eq!(walk.next.capacity(), 0, "only root indices need buffering");
+        assert!(matches!(
+            walk.next_timeout(std::time::Duration::ZERO),
+            Ok(Some((7, RootEvent::Finished)))
+        ));
+        for root in [2, 9] {
+            assert!(matches!(walk.next(), Some((idx, RootEvent::Finished)) if idx == root));
+        }
+        assert!(walk.next().is_none());
+    }
+
+    #[test]
     fn timed_walk_keeps_queued_events_when_empty_batches_exhaust_the_deadline() {
         use std::time::Duration;
 
@@ -2138,6 +2195,7 @@ mod tests {
         pool.shared.events.try_send(Event::Finished).unwrap();
         let mut walk = RootWalk {
             next: Vec::new(),
+            initial_finished: Vec::new(),
             pool: Some(pool),
         };
 
@@ -2939,8 +2997,15 @@ mod tests {
             true
         });
         let options = Options::default();
-        let (next, jobs, next_directory_id) =
-            begin_walks([(0, Entry::from_path(dir.path(), options))], &descend);
+        let mut next = Vec::new();
+        let (jobs, next_directory_id) = begin_walks(
+            [(0, Entry::from_path(dir.path(), options))],
+            &descend,
+            |root_idx, entry, finished| {
+                assert!(!finished);
+                next.push((root_idx, RootEvent::Entry(entry)));
+            },
+        );
         let pool = start_pool(8, Order::Completion, options, next_directory_id);
         let deadline = Instant::now() + Duration::from_secs(5);
         while !pool
@@ -2955,6 +3020,7 @@ mod tests {
         start_jobs(&pool, jobs);
         let walk = RootWalk {
             next,
+            initial_finished: Vec::new(),
             pool: Some(pool),
         };
         let mut workers = HashSet::new();
