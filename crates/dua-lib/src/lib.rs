@@ -25,10 +25,11 @@
 //! pool emits its final event once all roots finish and root submissions are closed; dropping
 //! the iterator stops and joins all workers.
 //!
-//! Linux completion-order metadata walks combine results across directory jobs into batches of
-//! at most 512 entries per worker. Partial batches are published before descent callbacks or
-//! parking. Root entries, errors, and parent-first results are sent directly. Buffered entries
-//! keep their root active until they have been published, so completion cannot overtake them.
+//! Linux completion-order metadata walks combine file-only results across directory jobs into
+//! batches of at most 512 entries per worker. Partial batches are published before descent
+//! callbacks or parking. Directory batches, root entries, errors, and parent-first results are
+//! sent directly. Buffered entries keep their root active until they have been published, so
+//! completion cannot overtake them.
 #![deny(unsafe_code)]
 #![deny(missing_docs)]
 
@@ -296,6 +297,14 @@ struct Output {
 impl Output {
     const CAPACITY: usize = 512;
 
+    fn coalesces(shared: &PoolShared) -> bool {
+        cfg!(target_os = "linux")
+            && matches!(shared.order, Order::Completion)
+            && !shared.options.skip_metadata
+            && shared.options.queued_batches_per_worker != 0
+            && shared.visitor.is_none()
+    }
+
     fn send(&mut self, root: &Arc<Root>, batch: Batch, shared: &PoolShared) -> bool {
         if shared.stop.load(AtomicOrdering::Relaxed) {
             return false;
@@ -303,17 +312,14 @@ impl Output {
         if shared.visitor.is_some() {
             return self.send_direct(root.index, batch, shared);
         }
-        let coalesce = cfg!(target_os = "linux")
-            && matches!(shared.order, Order::Completion)
-            && !shared.options.skip_metadata
-            && shared.options.queued_batches_per_worker != 0;
         match batch {
             Ok(mut entries)
-                if coalesce
+                if Self::coalesces(shared)
                     && entries.iter().all(|entry| {
-                        entry
-                            .as_ref()
-                            .is_ok_and(|entry| entry.metadata.as_ref().is_some_and(Result::is_ok))
+                        entry.as_ref().is_ok_and(|entry| {
+                            !entry.file_type.is_dir()
+                                && entry.metadata.as_ref().is_some_and(Result::is_ok)
+                        })
                     }) =>
             {
                 if entries.is_empty() {
@@ -1815,7 +1821,7 @@ fn allocate_directory_id(shared: &PoolShared) -> DirectoryId {
 }
 
 /// Publish a directory batch and schedule its accepted child-directory jobs.
-/// `ParentFirst` sends the batch before exposing child jobs; `Completion` exposes child jobs first.
+/// `ParentFirst` and coalesced walks send directory batches before exposing their child jobs.
 /// Child jobs are counted before either action; the caller completes the current job after EOF.
 ///
 /// Returns `true` if the batch was sent or buffered and child jobs were scheduled, or `false`
@@ -1830,22 +1836,16 @@ fn publish_directory(
 ) -> bool {
     root.pending.fetch_add(jobs.len(), AtomicOrdering::Relaxed);
 
-    match shared.order {
-        Order::ParentFirst => {
-            if !output.send(root, batch, shared) {
-                return false;
-            }
-            schedule_jobs(jobs, worker, shared);
+    if matches!(shared.order, Order::ParentFirst) || !jobs.is_empty() && Output::coalesces(shared) {
+        if !output.send(root, batch, shared) {
+            return false;
         }
-        Order::Completion => {
-            schedule_jobs(jobs, worker, shared);
-            if !output.send(root, batch, shared) {
-                return false;
-            }
-        }
+        schedule_jobs(jobs, worker, shared);
+        true
+    } else {
+        schedule_jobs(jobs, worker, shared);
+        output.send(root, batch, shared)
     }
-
-    true
 }
 
 /// Complete a job, publishing root completion before releasing its pool-wide count.
@@ -3047,6 +3047,43 @@ mod tests {
             "a wide local directory must amortize result-channel transfers: \
              {count} entries required {batches} batches"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn completion_walk_publishes_a_directory_before_its_child_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = Options::default();
+        let entry = Entry::from_path(dir.path(), options).unwrap();
+        let pool = start_pool(1, Order::Completion, options, 1);
+        let worker = Worker::new_lifo();
+        let root = Arc::new(Root {
+            index: 7,
+            pending: AtomicUsize::new(1),
+            descend: Arc::new(|_, _| true),
+        });
+        let child_read = Job::ReadDir {
+            root: Arc::clone(&root),
+            path: Arc::from(dir.path()),
+            directory_id: 0,
+            entry_depth: 1,
+        };
+        assert!(publish_directory(
+            &root,
+            Ok(vec![Ok(entry)]),
+            vec![child_read],
+            &worker,
+            &pool.shared,
+            &mut Output::default(),
+        ));
+        let event = pool.events.as_ref().unwrap().try_recv();
+        let Ok(Event::Batch { root_idx: 7, batch }) = event else {
+            panic!("the directory must be available before the worker runs the queued child read");
+        };
+        let entries = batch.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].as_ref().unwrap().path(), dir.path());
+        assert!(matches!(worker.pop(), Some(Job::ReadDir { .. })));
     }
 
     #[cfg(target_os = "linux")]
