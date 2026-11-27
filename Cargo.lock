@@ -701,6 +701,7 @@ dependencies = [
  "dua-core",
  "fern",
  "filesize",
+ "foldhash 0.2.0",
  "gix",
  "human_format",
  "inferno",

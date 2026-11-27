@@ -74,6 +74,7 @@ clap = { version = "4.0.29", features = ["derive", "env"] }
 clap_complete = "4.5.54"
 byte-unit = { version = "5.2.5", features = ["u128"] }
 itertools = "0.15.0"
+foldhash = "0.2.0"
 num_cpus = "1.10.0"
 anyhow = "1.0.31"
 inferno = { version = "0.12.8", default-features = false }

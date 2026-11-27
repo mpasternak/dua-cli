@@ -1,4 +1,6 @@
-use std::collections::HashMap;
+// Inode lookups happen for most entries of every traversal. foldhash is much faster than the
+// default SipHash, and its hasher is still seeded randomly per process.
+use foldhash::HashMap;
 
 // Darwin's `nlink_t` is 16 bits, so this marker cannot collide with an actual link count.
 #[cfg(target_os = "macos")]
@@ -182,7 +184,7 @@ impl InodeFilter {
 
 #[cfg(target_os = "macos")]
 mod apfs {
-    use std::collections::HashSet;
+    use foldhash::HashSet;
 
     impl super::InodeFilter {
         /// Return allocated bytes while counting a cloned data stream only once.
