@@ -2786,7 +2786,8 @@ mod tests {
             UNIX_EPOCH - Duration::from_nanos(i64::MAX as u64),
         ];
         let wide_times = [
-            UNIX_EPOCH + Duration::from_nanos(i64::MAX as u64 + 1),
+            // One microsecond past the limit, as Windows stores times in 100 ns steps.
+            UNIX_EPOCH + Duration::from_nanos(i64::MAX as u64) + Duration::from_micros(1),
             UNIX_EPOCH - Duration::new(i64::MAX as u64 / 1_000_000_000 + 1, 0),
             UNIX_EPOCH + Duration::new(10_000_000_000, 999_999_900),
         ];
