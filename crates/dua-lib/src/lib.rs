@@ -458,6 +458,14 @@ pub enum RootEvent {
     Finished,
 }
 
+/// Per-root events exposed by [`RootWalk::next_batch()`], which keeps batches intact.
+pub enum RootBatchEvent {
+    /// Entries or filesystem errors produced while walking the root, in the order they were found.
+    Entries(Vec<Result<Entry, Error>>),
+    /// All entries for the root have been emitted.
+    Finished,
+}
+
 struct PoolShared {
     /// Shared queue for initial roots, newly submitted roots, and input closure.
     injector: Injector<Job>,
@@ -976,6 +984,43 @@ impl RootWalk {
             }
             if self.pool.is_some() && started.elapsed() >= timeout {
                 return Err(std::sync::mpsc::RecvTimeoutError::Timeout);
+            }
+        }
+    }
+
+    /// Like [`Iterator::next()`], but return all entries the workers produced together as one batch,
+    /// which spares the caller from handling each entry on its own.
+    pub fn next_batch(&mut self) -> Option<(usize, RootBatchEvent)> {
+        fn from_single((root_idx, event): (usize, RootEvent)) -> (usize, RootBatchEvent) {
+            match event {
+                RootEvent::Entry(entry) => (root_idx, RootBatchEvent::Entries(vec![entry])),
+                RootEvent::Finished => (root_idx, RootBatchEvent::Finished),
+            }
+        }
+        loop {
+            if let Some(entry) = self.pop_buffered() {
+                return Some(from_single(entry));
+            }
+            match self.pool.as_ref()?.events.as_ref()?.recv() {
+                Ok(Event::Batch {
+                    root_idx,
+                    batch: Ok(entries),
+                }) => {
+                    if !entries.is_empty() {
+                        return Some((root_idx, RootBatchEvent::Entries(entries)));
+                    }
+                }
+                Ok(event) => {
+                    if let Some(item) = self.accept_event(event) {
+                        return Some(from_single(item));
+                    }
+                }
+                Err(_) => {
+                    return Some(from_single((
+                        0,
+                        RootEvent::Entry(Err(io::Error::other("directory worker stopped").into())),
+                    )));
+                }
             }
         }
     }

@@ -319,6 +319,39 @@ impl WalkOptions {
         })
     }
 
+    /// Like [`Self::iter_from_paths()`], but yield entries in the batches produced by the workers.
+    pub(crate) fn iter_batches_from_paths(
+        &self,
+        roots: Vec<WalkRoot>,
+        skip_root: bool,
+        order: walk::Order,
+    ) -> impl Iterator<Item = (usize, walk::RootBatchEvent)> + use<> {
+        let (indexed_roots, descend, is_excluded) = self.prepare_roots(roots);
+        let mut walk = walk::walk_root_entries(
+            indexed_roots,
+            self.threads,
+            order,
+            self.metadata_options,
+            move |root_idx, entry| descend(root_idx, entry),
+        );
+
+        std::iter::from_fn(move || walk.next_batch()).filter_map(move |(root_idx, event)| {
+            match event {
+                walk::RootBatchEvent::Entries(mut entries) => {
+                    entries.retain(|entry| match entry {
+                        Ok(entry) => {
+                            (!skip_root || entry.depth > 0) && !is_excluded(root_idx, entry)
+                        }
+                        Err(_) => true,
+                    });
+                    (!entries.is_empty())
+                        .then_some((root_idx, walk::RootBatchEvent::Entries(entries)))
+                }
+                walk::RootBatchEvent::Finished => Some((root_idx, walk::RootBatchEvent::Finished)),
+            }
+        })
+    }
+
     /// Reduce entries where metadata is collected, retaining the ordinary exclusion rules.
     pub(crate) fn visit_from_paths(
         &self,

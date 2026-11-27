@@ -927,13 +927,42 @@ pub enum TraversalEvent {
     /// Entries are sent in batches to avoid paying for channel synchronization once per entry.
     /// Use [`TraversalEvent::flatten()`] to handle them one by one.
     Batch(Vec<TraversalEvent>),
+    /// Consecutive entries of the same root, in the order they were discovered, along with the
+    /// context that [`TraversalEvent::Entry`] carries for each of them.
+    Entries {
+        /// The discovered entries, or the I/O errors encountered while reading them.
+        entries: Vec<Result<crate::walk::Entry, crate::walk::Error>>,
+        /// The path of the input root being traversed.
+        root_path: Arc<PathBuf>,
+        /// The input root's device ID.
+        device_id: u64,
+        /// The input root's index in the original input list.
+        root_idx: usize,
+    },
 }
 
 impl TraversalEvent {
     /// Return the events contained in a [`TraversalEvent::Batch`], or this event alone.
     pub fn flatten(self) -> impl Iterator<Item = TraversalEvent> {
         match self {
-            Self::Batch(events) => itertools::Either::Left(events.into_iter()),
+            Self::Batch(events) => {
+                itertools::Either::Left(itertools::Either::Left(events.into_iter()))
+            }
+            Self::Entries {
+                entries,
+                root_path,
+                device_id,
+                root_idx,
+            } => itertools::Either::Left(itertools::Either::Right(entries.into_iter().map(
+                move |entry| {
+                    TraversalEvent::Entry(
+                        entry.map(TraversalEntry),
+                        Arc::clone(&root_path),
+                        device_id,
+                        root_idx,
+                    )
+                },
+            ))),
             event => itertools::Either::Right(std::iter::once(event)),
         }
     }
@@ -963,6 +992,10 @@ pub struct BackgroundTraversal {
     pub event_rx: Receiver<TraversalEvent>,
     clean_stages: HashMap<usize, CleanStage>,
     _cancelled: Option<CancelOnDrop>,
+    /// Size and entry count still to be added to a directory and all of its ancestors.
+    pending_ancestors: Option<(TreeIndex, u128, u64)>,
+    /// Whether entries of one batch are being integrated, so `pending_ancestors` may grow.
+    coalescing: bool,
 }
 
 struct CleanStage {
@@ -1114,6 +1147,8 @@ impl BackgroundTraversal {
             event_rx,
             clean_stages: HashMap::new(),
             _cancelled: Some(CancelOnDrop(cancelled)),
+            pending_ancestors: None,
+            coalescing: false,
         })
     }
 
@@ -1234,38 +1269,25 @@ impl BackgroundTraversal {
                         root_paths.push(Arc::new(root_path));
                     }
 
-                    let mut batch = Vec::with_capacity(MAX_ENTRIES_PER_BATCH);
-                    for (root, event) in walk_options.iter_from_paths(
+                    for (root, event) in walk_options.iter_batches_from_paths(
                         walk_roots,
                         skip_root,
                         crate::walk::Order::ParentFirst,
                     ) {
-                        let crate::walk::RootEvent::Entry(entry) = event else {
+                        let crate::walk::RootBatchEvent::Entries(entries) = event else {
                             continue;
                         };
-                        batch.push(TraversalEvent::Entry(
-                            entry.map(TraversalEntry),
-                            Arc::clone(&root_paths[root]),
-                            device_ids[root],
-                            root_indices[root],
-                        ));
-                        // Send right away if the receiver is idle, so batching only kicks in
-                        // while it is still busy with previous entries.
-                        if (batch.len() >= MAX_ENTRIES_PER_BATCH || entry_tx.is_empty())
-                            && entry_tx
-                                .send(TraversalEvent::Batch(std::mem::replace(
-                                    &mut batch,
-                                    Vec::with_capacity(MAX_ENTRIES_PER_BATCH),
-                                )))
-                                .is_err()
-                        {
+                        let event = TraversalEvent::Entries {
+                            entries,
+                            root_path: Arc::clone(&root_paths[root]),
+                            device_id: device_ids[root],
+                            root_idx: root_indices[root],
+                        };
+                        if entry_tx.send(event).is_err() {
                             // The channel is closed, this means the user has
                             // requested to quit the app. Abort the walking.
                             return;
                         }
-                    }
-                    if !batch.is_empty() && entry_tx.send(TraversalEvent::Batch(batch)).is_err() {
-                        return;
                     }
                     if entry_tx.send(TraversalEvent::Finished).is_err() {
                         log::error!("Failed to send TraversalEvents::Finished event");
@@ -1288,6 +1310,8 @@ impl BackgroundTraversal {
             event_rx: entry_rx,
             clean_stages: HashMap::new(),
             _cancelled: None,
+            pending_ancestors: None,
+            coalescing: false,
         })
     }
 
@@ -1303,6 +1327,39 @@ impl BackgroundTraversal {
     pub(crate) fn retain_depth(mut self, depth: Option<usize>) -> Self {
         self.retained_depth = depth;
         self
+    }
+
+    /// Add `size` and `entry_count` to `directory` and all of its ancestors, possibly later.
+    fn add_to_ancestors(
+        &mut self,
+        traversal: &mut Traversal,
+        directory: TreeIndex,
+        size: u128,
+        entry_count: u64,
+    ) {
+        if let Some((pending, pending_size, pending_count)) = &mut self.pending_ancestors
+            && *pending == directory
+        {
+            *pending_size += size;
+            *pending_count += entry_count;
+            return;
+        }
+        self.flush_ancestors(traversal);
+        self.pending_ancestors = Some((directory, size, entry_count));
+    }
+
+    /// Apply what [`Self::add_to_ancestors()`] deferred.
+    fn flush_ancestors(&mut self, traversal: &mut Traversal) {
+        let Some((directory, size, entry_count)) = self.pending_ancestors.take() else {
+            return;
+        };
+        let mut ancestor = Some(directory);
+        while let Some(index) = ancestor {
+            ancestor = traversal.tree.parent(index);
+            traversal
+                .tree
+                .add_size_and_entry_count(index, size, entry_count);
+        }
     }
 
     fn record_error_on_root(
@@ -1631,12 +1688,9 @@ impl BackgroundTraversal {
                     );
                 }
 
-                let mut ancestor = Some(parent_index);
-                while let Some(index) = ancestor {
-                    ancestor = traversal.tree.parent(index);
-                    traversal
-                        .tree
-                        .add_size_and_entry_count(index, file_size, entry_count);
+                self.add_to_ancestors(traversal, parent_index, file_size, entry_count);
+                if !self.coalescing {
+                    self.flush_ancestors(traversal);
                 }
 
                 if is_clean && InodeFilter::needs_tracking(&entry, &self.walk_options) {
@@ -1653,6 +1707,20 @@ impl BackgroundTraversal {
                 if self.throttle.as_ref().is_some_and(|t| t.can_update()) {
                     return Some(false);
                 }
+            }
+            event @ TraversalEvent::Entries { .. } => {
+                // Entries of a batch usually share their parent directory, so its ancestors
+                // only need to be updated once for all of them.
+                self.coalescing = true;
+                let mut result = None;
+                for event in event.flatten() {
+                    if let Some(is_finished) = self.integrate_traversal_event(traversal, event) {
+                        result = Some(result.unwrap_or(false) || is_finished);
+                    }
+                }
+                self.coalescing = false;
+                self.flush_ancestors(traversal);
+                return result;
             }
             TraversalEvent::Batch(events) => {
                 let mut result = None;
