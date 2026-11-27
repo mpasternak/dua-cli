@@ -237,6 +237,16 @@ files are coloured by extension and directories by the extension that fills most
 Entries too small for a readable tile are grouped into one `+N` tile. Arrow keys or `hjkl` move
 between tiles, `Enter` opens a directory or zooms into the `+N` tile, and `Backspace` goes back.
 
+![Treemap of a directory with several projects](docs/treemap/overview.png)
+
+Inside a directory, the dominant file type colours each subdirectory:
+
+![Treemap inside a project](docs/treemap/inside-directory.png)
+
+After zooming into the `+N` tile, the small entries get the whole screen:
+
+![Treemap zoomed into the small entries](docs/treemap/zoomed-small-entries.png)
+
 Please note that great care has been taken to prevent accidental deletions due to a multi-stage
 process, which makes this mode viable for exploration.
 
